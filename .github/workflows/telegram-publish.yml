@@ -1,0 +1,250 @@
+name: Publish Mini App from Telegram
+run-name: Telegram Mini App update
+on:
+  workflow_dispatch:
+    inputs:
+      session_sha:
+        description: Prepared upload commit
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: telegram-mini-app-publication
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SESSION_SHA: ${{ inputs.session_sha }}
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      PUBLISH_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
+    steps:
+      - name: Validate, publish and verify original files
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          """Runs only in GitHub Actions. Receives file references, preserves source bytes."""
+          import base64
+          import hashlib
+          import json
+          import math
+          import os
+          import re
+          import subprocess
+          import sys
+          import tempfile
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          
+          REPO = "yulianajuravleva111/knizhnaya-polka-mini-app"
+          APP = "https://yulianajuravleva111.github.io/knizhnaya-polka-mini-app/"
+          PREFIX = "BOOKSHELF_UPLOAD_V1\n"
+          FILES = ("index.html", "data.json")
+          MAX_SIZE = 19 * 1024 * 1024
+          
+          
+          class UserError(Exception):
+              pass
+          
+          
+          def request(url, body=None, headers=None, limit=32 * 1024 * 1024, method=None):
+              data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+              req = urllib.request.Request(url, data=data, headers=headers or {}, method=method)
+              try:
+                  with urllib.request.urlopen(req, timeout=40) as response:
+                      result = response.read(limit + 1)
+                      if len(result) > limit:
+                          raise UserError("Файл превышает допустимый размер.")
+                      return result
+              except urllib.error.HTTPError as exc:
+                  raise UserError(f"Сервис не выполнил запрос (HTTP {exc.code}). Проверьте настройки и права токенов.") from None
+              except (urllib.error.URLError, TimeoutError):
+                  raise UserError("Сервис временно недоступен. Повторите позже.") from None
+          
+          
+          def gh(path, body=None, method=None):
+              raw = request("https://api.github.com/repos/" + REPO + path, body, {
+                  "Authorization": "Bearer " + os.environ["PUBLISH_TOKEN"],
+                  "Accept": "application/vnd.github+json", "Content-Type": "application/json",
+                  "User-Agent": "Bookshelf-Publisher", "X-GitHub-Api-Version": "2022-11-28",
+              }, method=method)
+              return json.loads(raw) if raw else None
+          
+          
+          def tg(method, body):
+              raw = request("https://api.telegram.org/bot" + os.environ["BOT_TOKEN"] + "/" + method,
+                            body, {"Content-Type": "application/json"})
+              result = json.loads(raw)
+              if not result.get("ok"):
+                  raise UserError("Telegram не выполнил запрос. Проверьте токен бота.")
+              return result["result"]
+          
+          
+          def notify(chat, text):
+              tg("sendMessage", {"chat_id": chat, "text": text})
+          
+          
+          def download(info):
+              if not isinstance(info, dict) or not isinstance(info.get("size"), int) or not 0 < info["size"] <= MAX_SIZE:
+                  raise UserError("Недопустимый размер файла.")
+              item = tg("getFile", {"file_id": info["file_id"]})
+              path = item.get("file_path", "")
+              if not re.fullmatch(r"[A-Za-z0-9_./-]+", path) or ".." in path:
+                  raise UserError("Не удалось получить файл из Telegram.")
+              result = request("https://api.telegram.org/file/bot" + os.environ["BOT_TOKEN"] + "/" + path, limit=MAX_SIZE)
+              if len(result) != info["size"]:
+                  raise UserError("Файл получен не полностью. Пришлите его заново.")
+              return result
+          
+          
+          def validate(files):
+              try:
+                  html = files["index.html"].decode("utf-8-sig")
+                  data = json.loads(files["data.json"].decode("utf-8-sig"))
+              except (UnicodeDecodeError, json.JSONDecodeError):
+                  raise UserError("Проверьте кодировку UTF-8 и корректность data.json. Файлы не опубликованы.") from None
+              if not re.search(r"<html\b", html, re.I) or not re.search(r"<body\b", html, re.I):
+                  raise UserError("index.html не похож на полный HTML-файл.")
+              if not isinstance(data, dict) or not all(isinstance(data.get(k), dict) for k in ("app", "author", "reading")):
+                  raise UserError("В data.json отсутствуют настройки приложения.")
+              if not isinstance(data.get("categories"), list) or not isinstance(data.get("items"), list) or not data["items"]:
+                  raise UserError("В data.json нет каталога или рубрик.")
+              ids = set()
+              categories = {c.get("id") for c in data["categories"] if isinstance(c, dict)}
+              for b in data["items"]:
+                  if not isinstance(b, dict) or not isinstance(b.get("id"), str) or not b["id"] or b["id"] in ids or not b.get("title"):
+                      raise UserError("В каталоге найдены повторяющиеся ID или неполные карточки.")
+                  ids.add(b["id"])
+                  if not isinstance(b.get("categories"), list) or not isinstance(b.get("quotes"), list):
+                      raise UserError("В карточке книги некорректно заданы рубрики или цитаты.")
+                  if any(c not in categories for c in b["categories"]):
+                      raise UserError("Книга ссылается на отсутствующую рубрику.")
+                  for field in ("pages", "durationMinutes"):
+                      n = b.get(field)
+                      if n is not None and (isinstance(n, bool) or not isinstance(n, (int, float)) or not math.isfinite(n) or n <= 0):
+                          raise UserError("Некорректное число страниц или длительность в карточке.")
+              new_ids = data["app"].get("newIds")
+              if not isinstance(new_ids, list) or any(i not in ids for i in new_ids):
+                  raise UserError("Подборка новых материалов ссылается на отсутствующие карточки.")
+              # Parse inline JavaScript, but never run uploaded application code.
+              snippets = []
+              for attrs, body in re.findall(r"<script\b([^>]*)>([\s\S]*?)</script\s*>", html, re.I):
+                  if re.search(r"\bsrc\s*=", attrs, re.I) or not body.strip():
+                      continue
+                  if re.search(r"\btype\s*=\s*['\"](?:application/ld\+json|application/json)['\"]", attrs, re.I):
+                      continue
+                  if re.search(r"\btype\s*=\s*['\"]module['\"]", attrs, re.I):
+                      raise UserError("Этот загрузчик рассчитан на исходный HTML с обычными скриптами. Модульные скрипты требуют отдельной проверки.")
+                  snippets.append(body)
+              parser = "const fs=require('fs'),vm=require('vm');for(const s of JSON.parse(fs.readFileSync(0,'utf8')))new vm.Script(s);"
+              result = subprocess.run(["node", "-e", parser], input=json.dumps(snippets), text=True,
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+              if result.returncode:
+                  raise UserError("В JavaScript файла index.html найдена синтаксическая ошибка. Сайт не изменён.")
+              return len(data["items"])
+          
+          
+          def publish(session_sha, state, files):
+              ref = gh("/git/ref/heads/main")
+              main = gh("/git/commits/" + ref["object"]["sha"])
+              message = "Publish Mini App from Telegram (" + session_sha + ")"
+              if main["message"] == message:
+                  return main["sha"]
+              if ref["object"]["sha"] != state["base"]:
+                  raise UserError("Сайт изменился после начала загрузки. Отправьте /cancel, затем /update и оба файла заново.")
+              tree = []
+              for name in FILES:
+                  blob = gh("/git/blobs", {"content": base64.b64encode(files[name]).decode("ascii"), "encoding": "base64"})
+                  tree.append({"path": name, "mode": "100644", "type": "blob", "sha": blob["sha"]})
+              new_tree = gh("/git/trees", {"base_tree": main["tree"]["sha"], "tree": tree})
+              if new_tree["sha"] == main["tree"]["sha"]:
+                  return main["sha"]
+              commit = gh("/git/commits", {"message": message, "tree": new_tree["sha"], "parents": [main["sha"]]})
+              gh("/git/refs/heads/main", {"sha": commit["sha"], "force": False}, "PATCH")
+              return commit["sha"]
+          
+          
+          def verify_live(files):
+              expected = {name: hashlib.sha256(content).digest() for name, content in files.items()}
+              deadline = time.monotonic() + 420
+              while time.monotonic() < deadline:
+                  try:
+                      for name in FILES:
+                          url = APP + name + "?verify=" + str(time.time_ns())
+                          received = request(url, limit=MAX_SIZE)
+                          if hashlib.sha256(received).digest() != expected[name]:
+                              break
+                      else:
+                          return True
+                  except UserError:
+                      pass
+                  time.sleep(12)
+              return False
+          
+          
+          def cleanup(session_sha):
+              # Never remove a newer session created while this workflow was running.
+              try:
+                  ref = gh("/git/ref/heads/bot-upload")
+                  if ref["object"]["sha"] == session_sha:
+                      gh("/git/refs/heads/bot-upload", method="DELETE")
+              except UserError:
+                  pass
+          
+          
+          def main():
+              chat = None
+              committed = False
+              try:
+                  if not os.environ.get("BOT_TOKEN") or not os.environ.get("PUBLISH_TOKEN"):
+                      raise UserError("В GitHub ещё не добавлены Secrets BOT_TOKEN и PUBLISH_TOKEN.")
+                  sha = os.environ.get("SESSION_SHA", "")
+                  if not re.fullmatch("[a-f0-9]{40}", sha):
+                      raise UserError("Некорректная версия подготовленного обновления.")
+                  latest = gh("/git/ref/heads/bot-upload")
+                  if latest["object"]["sha"] != sha:
+                      raise UserError("Подготовлено более новое обновление. Используйте /status и новую кнопку.")
+                  session = gh("/git/commits/" + sha)
+                  if not session["message"].startswith(PREFIX):
+                      raise UserError("Неверный формат сессии обновления.")
+                  state = json.loads(session["message"][len(PREFIX):])
+                  if not re.fullmatch(r"[1-9][0-9]{0,15}", str(state.get("admin", ""))):
+                      raise UserError("Не определён владелец обновления.")
+                  chat = state["admin"]
+                  if not re.fullmatch("[a-f0-9]{40}", state.get("base", "")):
+                      raise UserError("Не определена исходная версия сайта.")
+                  notify(chat, "Проверяю два файла перед публикацией…")
+                  files = {name: download(state["files"][name]) for name in FILES}
+                  count = validate(files)
+                  # Check cancellation or replacement again after downloads and validation.
+                  if gh("/git/ref/heads/bot-upload")["object"]["sha"] != sha:
+                      raise UserError("Загрузка отменена или обновлена. Публикация остановлена.")
+                  publish(sha, state, files)
+                  committed = True
+                  notify(chat, f"Файлы проверены и загружены на GitHub. Материалов: {count}. Ожидаю обновления GitHub Pages…")
+                  if verify_live(files):
+                      cleanup(sha)
+                      notify(chat, "✅ Приложение обновлено! Оба файла доступны и побайтово совпадают с присланными.\n\nЗакройте Mini App и откройте снова.\nhttps://t.me/bookshelfAP_bot?startapp=open")
+                  else:
+                      notify(chat, "Файлы загружены на GitHub, но публикация Pages пока не подтверждена. Подождите несколько минут и проверьте приложение. Не отправляйте новую загрузку до проверки.\n" + APP)
+              except Exception as exc:
+                  text = str(exc) if isinstance(exc, UserError) else "Не удалось обработать обновление. Проверьте настройки публикации."
+                  text += "\nФайлы уже загружены в main; готовность сайта ещё нужно проверить." if committed else "\nПубликация не подтверждена. Проверьте сайт и /status перед повторной отправкой."
+                  print("Publication did not complete. Check settings; credentials and uploaded file contents are omitted.")
+                  if chat and os.environ.get("BOT_TOKEN"):
+                      try:
+                          notify(chat, "⚠️ " + text)
+                      except Exception:
+                          pass
+                  return 1
+              return 0
+          
+          
+          if __name__ == "__main__":
+              sys.exit(main())
+          
+          PY
